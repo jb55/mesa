@@ -492,7 +492,7 @@ std::pair<PhysReg, bool> get_reg_impl(ra_ctx& ctx,
           instr->operands[j].physReg() >= lb &&
           instr->operands[j].physReg() < ub) {
          assert(instr->operands[j].isFixed());
-         assert(reg_file[instr->operands[j].physReg().reg] == 0);
+         assert(reg_file[instr->operands[j].physReg()] == 0);
          reg_file.fill(instr->operands[j].physReg(), instr->operands[j].size(), 0xFFFFFFFF);
          killed_ops += instr->operands[j].getTemp().size();
       }
