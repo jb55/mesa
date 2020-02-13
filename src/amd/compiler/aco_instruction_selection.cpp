@@ -394,6 +394,21 @@ Temp get_alu_src(struct isel_context *ctx, nir_alu_src src, unsigned size=1)
 
    Temp vec = get_ssa_temp(ctx, src.src.ssa);
    unsigned elem_size = vec.size() / src.src.ssa->num_components;
+   if (elem_size == 0 && vec.type() == RegType::sgpr) {
+      assert(src.src.ssa->bit_size == 8 || src.src.ssa->bit_size == 16);
+      assert(size == 1);
+      if (src.swizzle[0] == 0)
+         return vec;
+
+      Temp dst{ctx->program->allocateId(), s1};
+      aco_ptr<SOP2_instruction> bfe{create_instruction<SOP2_instruction>(aco_opcode::s_bfe_u32, Format::SOP2, 2, 1)};
+      bfe->operands[0] = Operand(vec);
+      bfe->operands[1] = Operand(uint32_t((src.src.ssa->bit_size << 16) | (src.src.ssa->bit_size * src.swizzle[0])));
+      bfe->definitions[0] = Definition(dst);
+      ctx->block->instructions.emplace_back(std::move(bfe));
+      return dst;
+   }
+
    assert(elem_size > 0); /* TODO: 8 and 16-bit vectors not supported */
    assert(vec.size() % elem_size == 0);
 
@@ -4456,12 +4471,11 @@ void visit_load_push_constant(isel_context *ctx, nir_intrinsic_instr *instr)
 {
    Builder bld(ctx->program, ctx->block);
    Temp dst = get_ssa_temp(ctx, &instr->dest.ssa);
-
    unsigned offset = nir_intrinsic_base(instr);
+   unsigned count = instr->dest.ssa.num_components;
    nir_const_value *index_cv = nir_src_as_const_value(instr->src[0]);
-   if (index_cv && instr->dest.ssa.bit_size == 32) {
 
-      unsigned count = instr->dest.ssa.num_components;
+   if (index_cv && instr->dest.ssa.bit_size == 32) {
       unsigned start = (offset + index_cv->u32) / 4u;
       start -= ctx->args->ac.base_inline_push_consts;
       if (start + count <= ctx->args->ac.num_inline_push_consts) {
@@ -4484,9 +4498,17 @@ void visit_load_push_constant(isel_context *ctx, nir_intrinsic_instr *instr)
    Temp ptr = convert_pointer_to_64_bit(ctx, get_arg(ctx, ctx->args->ac.push_constants));
    Temp vec = dst;
    bool trim = false;
+
+   if (instr->dest.ssa.bit_size == 8) {
+      bool aligned = index_cv && (offset + index_cv->u32) % 4 == 0;
+      bool fits_in_dword = count == 1 || (index_cv && ((offset + index_cv->u32) % 4 + count) <= 4);
+      if (!aligned)
+         vec = fits_in_dword ? bld.tmp(s1) : bld.tmp(s2);
+   }
+
    aco_opcode op;
 
-   switch (dst.size()) {
+   switch (vec.size()) {
    case 1:
       op = aco_opcode::s_load_dword;
       break;
@@ -4510,6 +4532,28 @@ void visit_load_push_constant(isel_context *ctx, nir_intrinsic_instr *instr)
    }
 
    bld.smem(op, Definition(vec), ptr, index);
+
+   if (instr->dest.ssa.bit_size == 8) {
+      if (vec == dst)
+         return;
+
+      Operand shift;
+      if (index_cv) {
+         shift = Operand(((offset + index_cv->u32) % 4 ) * 8);
+      } else {
+         if (vec.size() == 2)
+            index = bld.sop2(aco_opcode::s_and_b32, bld.def(s1), index, Operand(3u));
+         shift = bld.sop2(aco_opcode::s_lshl_b32, bld.def(s1), index, Operand(3u));
+      }
+      /* shift right by 8 * misalignment */
+      if (vec.size() == 1) {
+         bld.sop2(aco_opcode::s_lshr_b32, Definition(dst), vec, shift);
+      } else {
+         vec = bld.sop2(aco_opcode::s_lshr_b64, bld.def(s2), vec, shift);
+         bld.pseudo(aco_opcode::p_extract_vector, Definition(dst), vec, Operand(0u));
+      }
+      return;
+   }
 
    if (trim) {
       emit_split_vector(ctx, vec, 4);
