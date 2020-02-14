@@ -397,13 +397,19 @@ Temp get_alu_src(struct isel_context *ctx, nir_alu_src src, unsigned size=1)
    if (elem_size == 0 && vec.type() == RegType::sgpr) {
       assert(src.src.ssa->bit_size == 8 || src.src.ssa->bit_size == 16);
       assert(size == 1);
-      if (src.swizzle[0] == 0)
+      unsigned swizzle = src.swizzle[0];
+      if (vec.size() > 1) {
+         assert(src.src.ssa->bit_size == 16);
+         vec = emit_extract_vector(ctx, vec, swizzle / 2, s1);
+         swizzle = swizzle & 1;
+      }
+      if (swizzle == 0)
          return vec;
 
       Temp dst{ctx->program->allocateId(), s1};
       aco_ptr<SOP2_instruction> bfe{create_instruction<SOP2_instruction>(aco_opcode::s_bfe_u32, Format::SOP2, 2, 1)};
       bfe->operands[0] = Operand(vec);
-      bfe->operands[1] = Operand(uint32_t((src.src.ssa->bit_size << 16) | (src.src.ssa->bit_size * src.swizzle[0])));
+      bfe->operands[1] = Operand(uint32_t((src.src.ssa->bit_size << 16) | (src.src.ssa->bit_size * swizzle)));
       bfe->definitions[0] = Definition(dst);
       ctx->block->instructions.emplace_back(std::move(bfe));
       return dst;
@@ -4504,6 +4510,10 @@ void visit_load_push_constant(isel_context *ctx, nir_intrinsic_instr *instr)
       bool fits_in_dword = count == 1 || (index_cv && ((offset + index_cv->u32) % 4 + count) <= 4);
       if (!aligned)
          vec = fits_in_dword ? bld.tmp(s1) : bld.tmp(s2);
+   } else if (instr->dest.ssa.bit_size == 16) {
+      bool aligned = index_cv && (offset + index_cv->u32) % 4 == 0;
+      if (!aligned)
+         vec = count == 4 ? bld.tmp(s4) : count > 1 ? bld.tmp(s2) : bld.tmp(s1);
    }
 
    aco_opcode op;
@@ -4537,7 +4547,7 @@ void visit_load_push_constant(isel_context *ctx, nir_intrinsic_instr *instr)
       if (vec == dst)
          return;
 
-      Operand shift;
+      Operand shift; /* can be 0, 8, 16 or 24 */
       if (index_cv) {
          shift = Operand(((offset + index_cv->u32) % 4 ) * 8);
       } else {
@@ -4551,6 +4561,46 @@ void visit_load_push_constant(isel_context *ctx, nir_intrinsic_instr *instr)
       } else {
          vec = bld.sop2(aco_opcode::s_lshr_b64, bld.def(s2), vec, shift);
          bld.pseudo(aco_opcode::p_extract_vector, Definition(dst), vec, Operand(0u));
+      }
+      return;
+   } else if (instr->dest.ssa.bit_size == 16) {
+      if (vec == dst)
+         return;
+
+      Operand shift; /* can either be 16 if unaligned or 0 if aligned */
+      Temp select = bld.tmp(s1);
+      if (index_cv) {
+         shift = Operand(16u);
+      } else {
+         if (vec.size() > 1)
+            index = bld.sop2(aco_opcode::s_and_b32, bld.def(s1), bld.def(s1, scc), index, Operand(2u));
+         shift = bld.sop2(aco_opcode::s_lshl_b32, bld.def(s1), bld.scc(Definition(select)), index, Operand(3u));
+      }
+
+      if (vec.size() == 1) {
+         bld.sop2(aco_opcode::s_lshr_b32, Definition(dst), bld.def(s1, scc), vec, shift);
+      } else if (vec.size() == 2 && count == 2) {
+         vec = bld.sop2(aco_opcode::s_lshr_b64, bld.def(s2), bld.def(s1, scc), vec, shift);
+         bld.pseudo(aco_opcode::p_extract_vector, Definition(dst), vec, Operand(0u));
+      } else if (vec.size() == 2) {
+         assert(count == 3);
+         bld.sop2(aco_opcode::s_lshr_b64, Definition(dst), bld.def(s1, scc), vec, shift);
+         emit_split_vector(ctx, dst, 2);
+      } else {
+         // TODO: find better alignment information to avoid this
+         assert(vec.size() == 4 && count == 4);
+         Temp lo = bld.tmp(s2), hi = bld.tmp(s2);
+         bld.pseudo(aco_opcode::p_split_vector, Definition(lo), Definition(hi), vec);
+         hi = bld.pseudo(aco_opcode::p_extract_vector, bld.def(s1), hi, Operand(0u));
+         if (!index_cv)
+            hi = bld.sop2(aco_opcode::s_cselect_b32, bld.def(s1), hi, Operand(0u), select);
+         lo = bld.sop2(aco_opcode::s_lshr_b64, bld.def(s2), bld.def(s1, scc), lo, shift);
+         Temp mid = bld.tmp(s1);
+         lo = bld.pseudo(aco_opcode::p_split_vector, bld.def(s1), Definition(mid), lo);
+         hi = bld.sop2(aco_opcode::s_lshl_b32, bld.def(s1), bld.def(s1, scc), hi, shift);
+         mid = bld.sop2(aco_opcode::s_or_b32, bld.def(s1), bld.def(s1, scc), hi, mid);
+         bld.pseudo(aco_opcode::p_create_vector, Definition(dst), lo, mid);
+         emit_split_vector(ctx, dst, 2);
       }
       return;
    }
