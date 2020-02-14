@@ -896,14 +896,38 @@ void visit_alu_instr(isel_context *ctx, nir_alu_instr *instr)
    case nir_op_vec3:
    case nir_op_vec4: {
       std::array<Temp,NIR_MAX_VEC_COMPONENTS> elems;
-      aco_ptr<Pseudo_instruction> vec{create_instruction<Pseudo_instruction>(aco_opcode::p_create_vector, Format::PSEUDO, instr->dest.dest.ssa.num_components, 1)};
-      for (unsigned i = 0; i < instr->dest.dest.ssa.num_components; ++i) {
+      unsigned num = instr->dest.dest.ssa.num_components;
+      for (unsigned i = 0; i < num; ++i)
          elems[i] = get_alu_src(ctx, instr->src[i]);
-         vec->operands[i] = Operand{elems[i]};
+
+      if (instr->dest.dest.ssa.bit_size >= 32 || dst.type() == RegType::vgpr) {
+         aco_ptr<Pseudo_instruction> vec{create_instruction<Pseudo_instruction>(aco_opcode::p_create_vector, Format::PSEUDO, instr->dest.dest.ssa.num_components, 1)};
+         for (unsigned i = 0; i < num; ++i)
+            vec->operands[i] = Operand{elems[i]};
+         vec->definitions[0] = Definition(dst);
+         ctx->block->instructions.emplace_back(std::move(vec));
+         ctx->allocated_vec.emplace(dst.id(), elems);
+      } else {
+         // TODO: that is a bit suboptimal..
+         Temp mask = bld.copy(bld.def(s1), Operand((1u << instr->dest.dest.ssa.bit_size) - 1));
+         for (unsigned i = 0; i < num - 1; ++i)
+            if (((i+1) * instr->dest.dest.ssa.bit_size) % 32)
+               elems[i] = bld.sop2(aco_opcode::s_and_b32, bld.def(s1), bld.def(s1, scc), elems[i], mask);
+         for (unsigned i = 0; i < num; ++i) {
+            unsigned bit = i * instr->dest.dest.ssa.bit_size;
+            if (bit % 32 == 0) {
+               elems[bit / 32] = elems[i];
+            } else {
+               elems[i] = bld.sop2(aco_opcode::s_lshl_b32, bld.def(s1), bld.def(s1, scc),
+                                   elems[i], Operand((i * instr->dest.dest.ssa.bit_size) % 32));
+               elems[bit / 32] = bld.sop2(aco_opcode::s_or_b32, bld.def(s1), bld.def(s1, scc), elems[bit / 32], elems[i]);
+            }
+         }
+         if (dst.size() == 1)
+            bld.copy(Definition(dst), elems[0]);
+         else
+            bld.pseudo(aco_opcode::p_create_vector, Definition(dst), elems[0], elems[1]);
       }
-      vec->definitions[0] = Definition(dst);
-      ctx->block->instructions.emplace_back(std::move(vec));
-      ctx->allocated_vec.emplace(dst.id(), elems);
       break;
    }
    case nir_op_mov: {
@@ -5643,7 +5667,8 @@ void visit_store_ssbo(isel_context *ctx, nir_intrinsic_instr *instr)
    rsrc = bld.smem(aco_opcode::s_load_dwordx4, bld.def(s4), rsrc, Operand(0u));
 
    bool smem = !ctx->divergent_vals[instr->src[2].ssa->index] &&
-               ctx->options->chip_class >= GFX8;
+               ctx->options->chip_class >= GFX8 &&
+               elem_size_bytes >= 4;
    if (smem)
       offset = bld.as_uniform(offset);
    bool smem_nonfs = smem && ctx->stage != fragment_fs;
@@ -5658,6 +5683,15 @@ void visit_store_ssbo(isel_context *ctx, nir_intrinsic_instr *instr)
       }
       int num_bytes = count * elem_size_bytes;
 
+      /* dword or larger stores have to be dword-aligned */
+      if (elem_size_bytes < 4 && num_bytes > 2) {
+         // TODO: improve alignment check of sub-dword stores
+         unsigned count_new = 2 / elem_size_bytes;
+         writemask |= ((1 << (count - count_new)) - 1) << (start + count_new);
+         count = count_new;
+         num_bytes = 2;
+      }
+
       if (num_bytes > 16) {
          assert(elem_size_bytes == 8);
          writemask |= (((count - 2) << 1) - 1) << (start + 2);
@@ -5665,12 +5699,20 @@ void visit_store_ssbo(isel_context *ctx, nir_intrinsic_instr *instr)
          num_bytes = 16;
       }
 
-      // TODO: check alignment of sub-dword stores
-      // TODO: split 3 bytes. there is no store instruction for that
-
       Temp write_data;
-      if (count != instr->num_components) {
-         emit_split_vector(ctx, data, instr->num_components);
+      if (elem_size_bytes < 4) {
+         if (data.type() == RegType::sgpr) {
+            data = as_vgpr(ctx, data);
+            emit_split_vector(ctx, data, 4 * data.size() / elem_size_bytes);
+         }
+         RegClass rc = RegClass(RegType::vgpr, elem_size_bytes).as_subdword();
+         aco_ptr<Pseudo_instruction> vec{create_instruction<Pseudo_instruction>(aco_opcode::p_create_vector, Format::PSEUDO, count, 1)};
+         for (int i = 0; i < count; i++)
+            vec->operands[i] = Operand(emit_extract_vector(ctx, data, start + i, rc));
+         write_data = bld.tmp(RegClass(RegType::vgpr, num_bytes).as_subdword());
+         vec->definitions[0] = Definition(write_data);
+         bld.insert(std::move(vec));
+      } else if (count != instr->num_components) {
          aco_ptr<Pseudo_instruction> vec{create_instruction<Pseudo_instruction>(aco_opcode::p_create_vector, Format::PSEUDO, count, 1)};
          for (int i = 0; i < count; i++) {
             Temp elem = emit_extract_vector(ctx, data, start + i, RegClass(data.type(), elem_size_bytes / 4));
@@ -5689,8 +5731,14 @@ void visit_store_ssbo(isel_context *ctx, nir_intrinsic_instr *instr)
          write_data = data;
       }
 
-      aco_opcode vmem_op, smem_op;
+      aco_opcode vmem_op, smem_op = aco_opcode::last_opcode;
       switch (num_bytes) {
+         case 1:
+            vmem_op = aco_opcode::buffer_store_byte;
+            break;
+         case 2:
+            vmem_op = aco_opcode::buffer_store_short;
+            break;
          case 4:
             vmem_op = aco_opcode::buffer_store_dword;
             smem_op = aco_opcode::s_buffer_store_dword;
@@ -5701,7 +5749,6 @@ void visit_store_ssbo(isel_context *ctx, nir_intrinsic_instr *instr)
             break;
          case 12:
             vmem_op = aco_opcode::buffer_store_dwordx3;
-            smem_op = aco_opcode::last_opcode;
             assert(!smem && ctx->options->chip_class > GFX6);
             break;
          case 16:
