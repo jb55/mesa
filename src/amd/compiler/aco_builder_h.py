@@ -378,6 +378,16 @@ public:
          return pseudo(aco_opcode::p_create_vector, dst, op);
       } else if (dst.regClass() == v1 || dst.regClass() == v1.as_linear()) {
         return vop1(aco_opcode::v_mov_b32, dst, op);
+      } else if (dst.regClass().is_subdword()) {
+        assert(dst.regClass() == v1b || dst.regClass() == v2b);
+        assert(op.regClass() == v1b || op.regClass() == v2b);
+        aco_ptr<SDWA_instruction> sdwa{create_instruction<SDWA_instruction>(aco_opcode::v_mov_b32, asSDWA(Format::VOP1), 1, 1)};
+        sdwa->operands[0] = op;
+        sdwa->definitions[0] = dst;
+        sdwa->sel[0] = op.bytes() == 1 ? sdwa_ubyte : sdwa_uword;
+        sdwa->dst_sel = dst.bytes() == 1 ? sdwa_ubyte : sdwa_uword;
+        sdwa->dst_preserve = true;
+        return insert(std::move(sdwa));
       } else {
         assert(dst.regClass() == s1);
         return sop1(aco_opcode::s_mov_b32, dst, op);
